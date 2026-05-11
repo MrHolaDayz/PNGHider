@@ -1,20 +1,33 @@
 """
-PNGHider — стеганография в PNG-изображениях.
+PNGHider — стеганография в PNG через LSB.
 
-Данные скрываются в младших битах байтов пикселей.
-Порядок позиций определяется паролем, что обеспечивает базовую защиту.
+Особенности:
+- скрытие данных в RGB/RGBA PNG
+- пароль для генерации карты позиций
+- опциональное шифрование вторым паролем
+- HMAC-проверка целостности
+- zlib-сжатие
+- защита от повреждённых данных
 
-Формат встроенного блока данных:
-    байт 0       — N, число байт под поле размера (1..4)
-    байты 1..N   — размер сжатых данных (big-endian)
-    байты N+1..  — zlib-сжатые исходные данные
+Формат payload:
 
-Основные функции:
-    hide    — спрятать данные в PNG
-    extract — извлечь данные из PNG
+    MAGIC      4B
+    FLAGS      1B
+    SALT       16B
+    NONCE      16B
+    SIZE       8B
+    HMAC       32B
+    DATA       N bytes
+
+FLAGS:
+    bit0 -> данные зашифрованы
 """
 
+from __future__ import annotations
+
 import hashlib
+import hmac
+import os
 import random
 import zlib
 
@@ -22,86 +35,150 @@ import numpy as np
 from PIL import Image
 
 
-# ---------------------------------------------------------------------------
-# Внутренние константы
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Константы
+# ============================================================================
 
-_STEP         = 3     # каждый STEP-й байт хранит одну группу бит
-_SAMPLE_SIZE  = 1024  # размер зоны, по которой вычисляется seed
-_SAMPLE_GUARD = _SAMPLE_SIZE  # позиции до этой границы исключаются из карты
-_MAX_N        = 4     # максимум байт под поле «размер архива»
+_MAGIC = b"PNGH"
+
+_SAMPLE_SIZE = 4096
+_STEP = 3
+
+_SALT_SIZE = 16
+_NONCE_SIZE = 16
+_HMAC_SIZE = 32
+
+_HEADER_SIZE = (
+    4
+    + 1
+    + _SALT_SIZE
+    + _NONCE_SIZE
+    + 8
+    + _HMAC_SIZE
+)
+
+_FLAG_ENCRYPTED = 1
 
 
-# ---------------------------------------------------------------------------
-# Заголовок блока данных
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Криптография
+# ============================================================================
 
-def _encode_header(data_len: int) -> bytes:
-    """Строит самоописывающий заголовок (N + data_len в big-endian)."""
-    for n in range(1, _MAX_N + 1):
-        if data_len < (1 << (n * 8)):
-            return bytes([n]) + data_len.to_bytes(n, "big")
-    raise ValueError(f"Данные слишком велики: {data_len} байт.")
-
-
-def _decode_header(raw: bytes) -> tuple[int, int]:
+def _derive_key(password: str, salt: bytes) -> bytes:
     """
-    Разбирает заголовок из байтовой строки.
-    Возвращает (data_len, полный_размер_заголовка).
+    Генерирует ключ из пароля через PBKDF2.
     """
-    if not raw:
-        raise ValueError("Пустой буфер — невозможно прочитать заголовок.")
-    n = raw[0]
-    if n < 1 or n > _MAX_N:
-        raise ValueError(
-            f"Некорректный заголовок (N={n}). "
-            "Неверный пароль или повреждённое изображение."
-        )
-    if len(raw) < 1 + n:
-        raise ValueError("Буфер обрезан — заголовок неполный.")
-    return int.from_bytes(raw[1 : 1 + n], "big"), 1 + n
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode(),
+        salt,
+        200_000,
+        32,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Карта позиций
-# ---------------------------------------------------------------------------
+def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    """
+    Генерирует псевдослучайный поток байт.
+    """
+    out = bytearray()
+    counter = 0
+
+    while len(out) < length:
+        block = hashlib.sha512(
+            key
+            + nonce
+            + counter.to_bytes(8, "big")
+        ).digest()
+
+        out.extend(block)
+        counter += 1
+
+    return bytes(out[:length])
+
+
+def _xor_bytes(a: bytes, b: bytes) -> bytes:
+    """
+    XOR двух байтовых строк.
+    """
+    return bytes(x ^ y for x, y in zip(a, b))
+
+
+def _encrypt(data: bytes, password: str, salt: bytes, nonce: bytes) -> bytes:
+    """
+    Шифрует данные поточным XOR-шифром.
+    """
+    key = _derive_key(password, salt)
+    stream = _keystream(key, nonce, len(data))
+    return _xor_bytes(data, stream)
+
+
+def _decrypt(data: bytes, password: str, salt: bytes, nonce: bytes) -> bytes:
+    """
+    Расшифровывает данные.
+    """
+    return _encrypt(data, password, salt, nonce)
+
+
+# ============================================================================
+# Работа с позициями
+# ============================================================================
 
 def _generate_map(
     password: str,
-    pixel_sample: bytes,
+    sample: bytes,
     total_bytes: int,
-    step: int = _STEP,
 ) -> list[int]:
     """
-    Возвращает перемешанный список байтовых позиций для записи/чтения.
+    Генерирует перемешанную карту позиций.
 
-    Seed получается из пароля и первых SAMPLE_SIZE байт пикселей,
-    которые не изменяются в процессе записи (зона сэмпла).
-    Позиции внутри этой зоны исключаются.
+    Первые SAMPLE_SIZE байт не используются,
+    чтобы seed не менялся после записи.
     """
-    slots = total_bytes // step
+    slots = total_bytes // _STEP
+
     if slots == 0:
         raise ValueError("Изображение слишком маленькое.")
 
     seed = int.from_bytes(
-        hashlib.sha512(password.encode() + pixel_sample).digest()[:8],
+        hashlib.sha512(
+            password.encode() + sample
+        ).digest()[:8],
         "big",
     )
-    rng = random.Random(seed)
-    indices = list(range(slots))
-    rng.shuffle(indices)
 
-    return [i * step for i in indices if i * step >= _SAMPLE_GUARD]
+    rng = random.Random(seed)
+
+    positions = [
+        i * _STEP
+        for i in range(slots)
+        if i * _STEP >= _SAMPLE_SIZE
+    ]
+
+    rng.shuffle(positions)
+
+    return positions
+
+
+def _capacity(position_count: int, depth: int) -> int:
+    """
+    Возвращает вместимость в байтах.
+    """
+    return position_count * depth // 8
 
 
 def _slots_needed(byte_count: int, depth: int) -> int:
-    """Количество позиций, необходимых для хранения byte_count байт."""
-    return -(-byte_count * 8 // depth)  # ceil(byte_count*8 / depth)
+    """
+    Возвращает число LSB-позиций,
+    необходимых для хранения byte_count байт.
+    """
+    bits = byte_count * 8
+    return (bits + depth - 1) // depth
 
 
-# ---------------------------------------------------------------------------
-# Запись и чтение битов
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Работа с битами
+# ============================================================================
 
 def _write_bits(
     pixels: np.ndarray,
@@ -109,269 +186,380 @@ def _write_bits(
     data: bytes,
     depth: int,
 ) -> None:
-    """Записывает data в младшие depth бит пикселей по карте positions."""
-    bits = bin(int.from_bytes(data, "big"))[2:].zfill(len(data) * 8)
-    mask_clear = 0xFF ^ ((1 << depth) - 1)
-    needed = _slots_needed(len(data), depth)
+    """
+    Записывает байты в младшие биты пикселей.
+    """
+    mask = (1 << depth) - 1
+    clear_mask = 0xFF ^ mask
 
-    for bit_pos, pos in zip(range(0, len(bits), depth), positions[:needed]):
-        if pos >= len(pixels):
-            raise IndexError(f"Позиция {pos} выходит за пределы массива.")
-        chunk = bits[bit_pos : bit_pos + depth].ljust(depth, "0")
-        pixels[pos] = (pixels[pos] & mask_clear) | int(chunk, 2)
+    bit_buffer = 0
+    bit_count = 0
+
+    pos_index = 0
+
+    for byte in data:
+        bit_buffer = (bit_buffer << 8) | byte
+        bit_count += 8
+
+        while bit_count >= depth:
+            bit_count -= depth
+
+            value = (
+                bit_buffer >> bit_count
+            ) & mask
+
+            pos = positions[pos_index]
+
+            pixels[pos] = (
+                pixels[pos] & clear_mask
+            ) | value
+
+            pos_index += 1
+
+    if bit_count:
+        value = (
+            bit_buffer << (depth - bit_count)
+        ) & mask
+
+        pos = positions[pos_index]
+
+        pixels[pos] = (
+            pixels[pos] & clear_mask
+        ) | value
 
 
 def _read_bits(
     pixels: np.ndarray,
     positions: list[int],
+    byte_count: int,
     depth: int,
 ) -> bytes:
-    """Читает младшие depth бит по карте positions и возвращает байты."""
+    """
+    Читает байты из младших бит пикселей.
+    """
     mask = (1 << depth) - 1
-    bits = "".join(
-        f"{pixels[p] & mask:0{depth}b}"
-        for p in positions
-        if p < len(pixels)
-    )
-    usable = (len(bits) // 8) * 8
-    return bytes(int(bits[i : i + 8], 2) for i in range(0, usable, 8))
+
+    out = bytearray()
+
+    bit_buffer = 0
+    bit_count = 0
+
+    needed_slots = _slots_needed(byte_count, depth)
+
+    for pos in positions[:needed_slots]:
+        value = pixels[pos] & mask
+
+        bit_buffer = (
+            bit_buffer << depth
+        ) | value
+
+        bit_count += depth
+
+        while bit_count >= 8:
+            bit_count -= 8
+
+            out.append(
+                (bit_buffer >> bit_count) & 0xFF
+            )
+
+            if len(out) == byte_count:
+                return bytes(out)
+
+    return bytes(out)
 
 
-# ---------------------------------------------------------------------------
-# Внутренняя однофайловая запись / чтение
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Работа с payload
+# ============================================================================
 
-def _image_capacity(image_path: str, depth: int) -> int:
-    """Возвращает число байт, которое вмещает изображение при данном depth."""
-    img = Image.open(image_path).convert("RGB")
-    pixels = np.array(img, dtype=np.uint8).flatten()
-    pos_map = _generate_map("_", pixels[:_SAMPLE_SIZE].tobytes(), len(pixels))
-    return len(pos_map) * depth // 8
-
-
-def _hide_single(image_path: str, password: str, payload: bytes, depth: int) -> None:
-    """Записывает готовый payload (уже с заголовком) в один PNG."""
-    img = Image.open(image_path).convert("RGB")
-    pixels = np.array(img, dtype=np.uint8).flatten()
-    sample = pixels[:_SAMPLE_SIZE].tobytes()
-    pos_map = _generate_map(password, sample, len(pixels))
-    needed = _slots_needed(len(payload), depth)
-    if needed > len(pos_map):
-        raise ValueError(
-            f"Данные не помещаются: нужно {needed} позиций, "
-            f"доступно {len(pos_map)}."
-        )
-    _write_bits(pixels, pos_map[:needed], payload, depth)
-    Image.fromarray(pixels.reshape(img.height, img.width, 3)).save(
-        image_path, "PNG", compress_level=0
-    )
-
-
-def _extract_single(image_path: str, password: str, depth: int) -> bytes:
-    """Читает payload (с заголовком) из одного PNG и возвращает исходные байты."""
-    img = Image.open(image_path).convert("RGB")
-    pixels = np.array(img, dtype=np.uint8).flatten()
-    sample = pixels[:_SAMPLE_SIZE].tobytes()
-    pos_map = _generate_map(password, sample, len(pixels))
-
-    h_raw = _read_bits(pixels, pos_map[:_slots_needed(1 + _MAX_N, depth)], depth)
-    data_len, header_size = _decode_header(h_raw)
-
-    total = header_size + data_len
-    raw = _read_bits(pixels, pos_map[:_slots_needed(total, depth)], depth)
-    return zlib.decompress(raw[header_size : header_size + data_len])
-
-
-# ---------------------------------------------------------------------------
-# Многофайловый заголовок чанка
-# ---------------------------------------------------------------------------
-#
-# Каждый PNG при многофайловой записи хранит один чанк со своим заголовком:
-#   4 байта — общее число чанков (big-endian)
-#   4 байта — индекс этого чанка (0-based, big-endian)
-#   4 байта — длина данных чанка
-#   далее   — zlib-сжатые данные всего сообщения (только своя часть)
-#
-# Однофайловый режим использует старый формат (_encode_header / _decode_header),
-# многофайловый — _CHUNK_HEADER_SIZE байт выше.
-
-_CHUNK_HEADER_SIZE = 12  # 3 × uint32
-
-
-def _encode_chunk_header(total_chunks: int, index: int, chunk_len: int) -> bytes:
-    return (
-        total_chunks.to_bytes(4, "big")
-        + index.to_bytes(4, "big")
-        + chunk_len.to_bytes(4, "big")
-    )
-
-
-def _decode_chunk_header(raw: bytes) -> tuple[int, int, int]:
-    """Возвращает (total_chunks, index, chunk_len)."""
-    if len(raw) < _CHUNK_HEADER_SIZE:
-        raise ValueError("Буфер слишком мал для чтения заголовка чанка.")
-    total  = int.from_bytes(raw[0:4], "big")
-    index  = int.from_bytes(raw[4:8], "big")
-    length = int.from_bytes(raw[8:12], "big")
-    return total, index, length
-
-
-# ---------------------------------------------------------------------------
-# Публичный API
-# ---------------------------------------------------------------------------
-
-def hide(
-    image_paths: "str | list[str]",
-    password: str,
+def _build_payload(
     data: bytes,
-    depth: int = 2,
-) -> None:
+    encryption_password: str | None,
+) -> bytes:
     """
-    Спрятать данные в одном или нескольких PNG-изображениях.
-
-    Если данные не влезают в переданные файлы, функция интерактивно
-    запрашивает пути к дополнительным PNG до тех пор, пока места не хватит.
-
-    Parameters
-    ----------
-    image_paths : путь к PNG или список путей
-    password    : пароль; нужен при извлечении
-    data        : произвольные байты для сокрытия
-    depth       : 1–8; бит на канал (больше → ёмкость ↑, незаметность ↓)
+    Создаёт payload для записи.
     """
-    if not (1 <= depth <= 8):
-        raise ValueError("depth должен быть от 1 до 8.")
+    flags = 0
 
-    # Нормализуем к списку
-    paths: list[str] = [image_paths] if isinstance(image_paths, str) else list(image_paths)
+    salt = os.urandom(_SALT_SIZE)
+    nonce = os.urandom(_NONCE_SIZE)
 
     compressed = zlib.compress(data)
 
-    # --- Однофайловый режим (старый формат, без чанков) ---
-    if len(paths) == 1:
-        payload = _encode_header(len(compressed)) + compressed
-        needed  = _slots_needed(len(payload), depth)
+    if encryption_password:
+        flags |= _FLAG_ENCRYPTED
 
-        img     = Image.open(paths[0]).convert("RGB")
-        pixels  = np.array(img, dtype=np.uint8).flatten()
-        sample  = pixels[:_SAMPLE_SIZE].tobytes()
-        pos_map = _generate_map(password, sample, len(pixels))
-
-        if needed <= len(pos_map):
-            _write_bits(pixels, pos_map[:needed], payload, depth)
-            Image.fromarray(pixels.reshape(img.height, img.width, 3)).save(
-                paths[0], "PNG", compress_level=0
-            )
-            return
-
-        # Одного файла не хватило — переходим в многофайловый режим
-        print(f"'{paths[0]}' слишком мал. Переключаюсь на многофайловый режим.")
-
-    # --- Многофайловый режим ---
-    # Сначала узнаём вместимость каждого файла (без учёта заголовка чанка)
-    def usable_capacity(path: str) -> int:
-        img    = Image.open(path).convert("RGB")
-        px     = np.array(img, dtype=np.uint8).flatten()
-        sample = px[:_SAMPLE_SIZE].tobytes()
-        pm     = _generate_map(password, sample, len(px))
-        # Вычитаем место под заголовок чанка
-        return max(0, len(pm) * depth // 8 - _CHUNK_HEADER_SIZE)
-
-    # Набираем файлы до тех пор, пока суммарная ёмкость не покроет данные
-    while sum(usable_capacity(p) for p in paths) < len(compressed):
-        used  = sum(usable_capacity(p) for p in paths)
-        remain = len(compressed) - used
-        print(
-            f"Недостаточно места: нужно ещё ~{remain} байт сжатых данных. "
-            f"Уже используется файлов: {len(paths)}."
+        compressed = _encrypt(
+            compressed,
+            encryption_password,
+            salt,
+            nonce,
         )
-        new_path = input("Введите путь к ещё одному PNG: ").strip()
-        if not new_path:
-            raise ValueError("Путь не введён — операция прервана.")
-        paths.append(new_path)
 
-    # Нарезаем compressed на чанки по ёмкости каждого файла
-    total_chunks = len(paths)
+        hmac_key = _derive_key(
+            encryption_password,
+            salt,
+        )
+    else:
+        hmac_key = hashlib.sha256(
+            salt
+        ).digest()
+
+    digest = hmac.new(
+        hmac_key,
+        compressed,
+        hashlib.sha256,
+    ).digest()
+
+    return (
+        _MAGIC
+        + bytes([flags])
+        + salt
+        + nonce
+        + len(compressed).to_bytes(8, "big")
+        + digest
+        + compressed
+    )
+
+
+def _parse_payload(
+    payload: bytes,
+    encryption_password: str | None,
+) -> bytes:
+    """
+    Извлекает и проверяет payload.
+    """
+    if len(payload) < _HEADER_SIZE:
+        raise ValueError("Payload слишком короткий.")
+
     offset = 0
-    for idx, path in enumerate(paths):
-        cap   = usable_capacity(path)
-        chunk = compressed[offset : offset + cap]
-        offset += cap
 
-        payload = _encode_chunk_header(total_chunks, idx, len(chunk)) + chunk
-        _hide_single(path, password, payload, depth)
+    magic = payload[offset:offset + 4]
+    offset += 4
 
-    print(f"Данные распределены по {total_chunks} файл(ам).")
+    if magic != _MAGIC:
+        raise ValueError(
+            "Данные не найдены или пароль неверный."
+        )
+
+    flags = payload[offset]
+    offset += 1
+
+    salt = payload[offset:offset + _SALT_SIZE]
+    offset += _SALT_SIZE
+
+    nonce = payload[offset:offset + _NONCE_SIZE]
+    offset += _NONCE_SIZE
+
+    size = int.from_bytes(
+        payload[offset:offset + 8],
+        "big",
+    )
+
+    offset += 8
+
+    expected_hmac = payload[
+        offset:offset + _HMAC_SIZE
+    ]
+
+    offset += _HMAC_SIZE
+
+    encrypted = payload[
+        offset:offset + size
+    ]
+
+    if len(encrypted) != size:
+        raise ValueError("Payload повреждён.")
+
+    if flags & _FLAG_ENCRYPTED:
+        if not encryption_password:
+            raise ValueError(
+                "Нужен encryption_password."
+            )
+
+        hmac_key = _derive_key(
+            encryption_password,
+            salt,
+        )
+    else:
+        hmac_key = hashlib.sha256(
+            salt
+        ).digest()
+
+    actual_hmac = hmac.new(
+        hmac_key,
+        encrypted,
+        hashlib.sha256,
+    ).digest()
+
+    if not hmac.compare_digest(
+        expected_hmac,
+        actual_hmac,
+    ):
+        raise ValueError(
+            "HMAC не совпадает."
+        )
+
+    if flags & _FLAG_ENCRYPTED:
+        encrypted = _decrypt(
+            encrypted,
+            encryption_password,
+            salt,
+            nonce,
+        )
+
+    return zlib.decompress(
+        encrypted,
+        max_length=1024 * 1024 * 1024,
+    )
+
+
+# ============================================================================
+# PNG
+# ============================================================================
+
+def _load_image(path: str):
+    """
+    Загружает PNG без потери каналов.
+    """
+    img = Image.open(path)
+
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA")
+
+    pixels = np.array(
+        img,
+        dtype=np.uint8,
+    )
+
+    flat = pixels.flatten()
+
+    return img, pixels, flat
+
+
+# ============================================================================
+# Публичный API
+# ============================================================================
+
+def hide(
+    image_path: str,
+    password: str,
+    data: bytes,
+    depth: int = 2,
+    encryption_password: str | None = None,
+) -> None:
+    """
+    Скрывает данные внутри PNG.
+    """
+    if not (1 <= depth <= 8):
+        raise ValueError(
+            "depth должен быть от 1 до 8."
+        )
+
+    payload = _build_payload(
+        data,
+        encryption_password,
+    )
+
+    img, pixels, flat = _load_image(
+        image_path
+    )
+
+    sample = flat[:_SAMPLE_SIZE].tobytes()
+
+    positions = _generate_map(
+        password,
+        sample,
+        len(flat),
+    )
+
+    needed = _slots_needed(
+        len(payload),
+        depth,
+    )
+
+    if needed > len(positions):
+        capacity = _capacity(
+            len(positions),
+            depth,
+        )
+
+        raise ValueError(
+            f"Недостаточно места. "
+            f"Максимум: {capacity} байт."
+        )
+
+    _write_bits(
+        flat,
+        positions,
+        payload,
+        depth,
+    )
+
+    Image.fromarray(
+        pixels,
+        mode=img.mode,
+    ).save(
+        image_path,
+        "PNG",
+    )
 
 
 def extract(
-    image_paths: "str | list[str]",
+    image_path: str,
     password: str,
     depth: int = 2,
+    encryption_password: str | None = None,
 ) -> bytes:
     """
-    Извлечь данные, спрятанные функцией hide().
-
-    Автоматически определяет однофайловый или многофайловый формат.
-    При многофайловой записи порядок файлов в списке не важен —
-    чанки собираются по индексам из заголовков.
-
-    Parameters
-    ----------
-    image_paths : путь к PNG или список путей
-    password    : должен совпадать с использованным при записи
-    depth       : должен совпадать с использованным при записи
-
-    Returns
-    -------
-    bytes : исходные данные
+    Извлекает данные из PNG.
     """
     if not (1 <= depth <= 8):
-        raise ValueError("depth должен быть от 1 до 8.")
+        raise ValueError(
+            "depth должен быть от 1 до 8."
+        )
 
-    paths: list[str] = [image_paths] if isinstance(image_paths, str) else list(image_paths)
+    _, _, flat = _load_image(
+        image_path
+    )
 
-    if len(paths) == 1:
-        # Пробуем однофайловый формат; если заголовок не распознан — многофайловый
-        try:
-            return _extract_single(paths[0], password, depth)
-        except ValueError:
-            pass  # возможно, файл записан в многофайловом формате
+    sample = flat[:_SAMPLE_SIZE].tobytes()
 
-    # --- Многофайловый режим ---
-    chunks: dict[int, bytes] = {}
-    total_chunks_expected: int | None = None
+    positions = _generate_map(
+        password,
+        sample,
+        len(flat),
+    )
 
-    for path in paths:
-        img     = Image.open(path).convert("RGB")
-        pixels  = np.array(img, dtype=np.uint8).flatten()
-        sample  = pixels[:_SAMPLE_SIZE].tobytes()
-        pos_map = _generate_map(password, sample, len(pixels))
+    header = _read_bits(
+        flat,
+        positions,
+        _HEADER_SIZE,
+        depth,
+    )
 
-        # Читаем заголовок чанка
-        h_slots = _slots_needed(_CHUNK_HEADER_SIZE, depth)
-        h_raw   = _read_bits(pixels, pos_map[:h_slots], depth)
-        total_chunks, index, chunk_len = _decode_chunk_header(h_raw)
+    if header[:4] != _MAGIC:
+        raise ValueError(
+            "Данные не найдены."
+        )
 
-        if total_chunks_expected is None:
-            total_chunks_expected = total_chunks
-        elif total_chunks != total_chunks_expected:
-            raise ValueError(
-                f"Файл '{path}': ожидалось {total_chunks_expected} чанков, "
-                f"получено {total_chunks}. Файлы из разных наборов?"
-            )
+    size = int.from_bytes(
+        header[37:45],
+        "big",
+    )
 
-        # Читаем тело чанка
-        total_payload = _CHUNK_HEADER_SIZE + chunk_len
-        full_raw = _read_bits(pixels, pos_map[:_slots_needed(total_payload, depth)], depth)
-        chunks[index] = full_raw[_CHUNK_HEADER_SIZE : _CHUNK_HEADER_SIZE + chunk_len]
+    total_size = (
+        _HEADER_SIZE + size
+    )
 
-    if total_chunks_expected is None:
-        raise ValueError("Не передано ни одного файла.")
+    payload = _read_bits(
+        flat,
+        positions,
+        total_size,
+        depth,
+    )
 
-    missing = set(range(total_chunks_expected)) - set(chunks)
-    if missing:
-        raise ValueError(f"Отсутствуют чанки с индексами: {sorted(missing)}.")
-
-    compressed = b"".join(chunks[i] for i in range(total_chunks_expected))
-    return zlib.decompress(compressed)
+    return _parse_payload(
+        payload,
+        encryption_password,
+    )
