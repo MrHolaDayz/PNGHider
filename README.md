@@ -118,7 +118,7 @@ pip install pillow numpy
 
 ## Скрытие текста
 
-```python id="ecow9t"
+```python
 from PNGHider import hide
 
 data = b"Hello world"
