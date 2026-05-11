@@ -111,7 +111,7 @@ Payload записывается в младшие биты:
 
 ```bash
 pip install pillow numpy
-
+```
 ---
 
 # Быстрый старт
